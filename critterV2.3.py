@@ -41,16 +41,46 @@ def generate_ip_range(start_ip, end_ip):
         ip_list.append(int_to_ip(ip_int))
     return ip_list
 
+
+# --------------------------------------
+# Helper Funcion
+# --------------------------------------
+
+
+def get_hostname(ip_addr):
+    """
+    Performs a reverse DNS lookup to find the hostname of an IP address.
+    Returns the hostname if found, if not then it returns "Unkown Host" or the original IP.
+    """
+
+    try:
+        # socket.gethostbyaddr returns a tuple: (hostname, aliaslist, ipaddrlist)
+        hostname_info = socket.gethostbyaddr(ip_addr)
+        return hostname_info[0]
+
+    except socket.herror:
+        # Error is raised if the hostname cannot be found via DNS
+        return "Unkown Host"
+    
+    except Exception as e:
+        # Handle other potential errors
+        return f"Error: {e}"
+
+
+
 # ----------------------------------------------------------------------
 # Core Scanning Logic (Modified for Multi-Port Check)
 # ----------------------------------------------------------------------
 
+
 def host_scan(target_ip, output_text_box, lock, active_hosts_list):
     """
     Checks if a host is active by attempting a quick TCP connect on the configured ports.
+    Also performs a hostname lookup if active.
     """
     
     is_active = False
+    hostname = "N/A"
     
     try:
         for port in PORTS_TO_CHECK:
@@ -63,6 +93,7 @@ def host_scan(target_ip, output_text_box, lock, active_hosts_list):
             if result == 0:
                 is_active = True
                 s.close()
+                hostname = get_hostname(target_ip)
                 break # Stop checking other ports once one is found
             s.close()
             
@@ -73,8 +104,8 @@ def host_scan(target_ip, output_text_box, lock, active_hosts_list):
         # Thread-safe writing to the GUI
         with lock:
             if is_active:
-                active_hosts_list.append(target_ip)
-                output_text_box.insert(tk.END, f"[ACTIVE] Host found: {target_ip}\n", 'active')
+                active_hosts_list.append((target_ip, hostname))
+                output_text_box.insert(tk.END, f"[ACTIVE] Host found: {target_ip} ({hostname})\n", 'active')
             else:
                 output_text_box.insert(tk.END, f"[INACTIVE] Host not responding: {target_ip}\n", 'inactive')
             output_text_box.see(tk.END)
@@ -218,8 +249,10 @@ def create_gui():
                 output_text_box.insert(tk.END, f"Total IPs Scanned: {len(ip_targets)}\n")
                 output_text_box.insert(tk.END, f"Active Hosts Found: {len(active_hosts)}\n", 'active')
                 output_text_box.insert(tk.END, "Active Host List:\n")
-                for host in active_hosts:
-                    output_text_box.insert(tk.END, f"  - {host}\n", 'active')
+
+                for ip_addr, hostname_result in active_hosts:
+                    output_text_box.insert(tk.END, f"  - {ip_addr} ({hostname_result})\n", 'active')
+
                 output_text_box.insert(tk.END, "-" * 50 + "\n")
                 output_text_box.see(tk.END)
 
