@@ -21,5 +21,9 @@ Critter is a Python-based GUI network scanner designed to discover active IoT de
 4. Active hosts will appear in green with hostname
 
 
+![Critter Screenshot](Picture1.png)
+
+
+
 
 
