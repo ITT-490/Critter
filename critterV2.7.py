@@ -1,11 +1,17 @@
 import socket
 import threading
 import tkinter as tk
-from tkinter import scrolledtext, messagebox, filedialog # Added filedialog for save dialog
+from tkinter import scrolledtext, messagebox, filedialog
 from datetime import datetime
 import ipaddress
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except Exception:
+    PSUTIL_AVAILABLE = False
 import time
-# --- NEW PDF IMPORTS ---
+from concurrent.futures import ThreadPoolExecutor
+# --- PDF IMPORTS ---
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from reportlab.lib.styles import getSampleStyleSheet
@@ -13,14 +19,13 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 # -----------------------
 
 # --- Configuration ---
-# List of ports to check sequentially on each host. If a host responds to ANY of these,
-# it is marked as ACTIVE. This increases the chance of finding both Linux (22) and Windows (445) hosts.
-PORTS_TO_CHECK = [22, 445]
+# Default list of ports to check. This is now used as a default value.
+DEFAULT_PORTS_TO_CHECK = [22, 445, 80] # Added port 80 as a common default
 SCAN_TIMEOUT = 0.25 # Faster timeout for speed
 # ---------------------
 
 # A global variable to store the final summary text (Active Hosts list) for the PDF function
-# This list stores (ip_addr, hostname) tuples
+# This list now stores (ip_addr, hostname, open_port) tuples
 FINAL_ACTIVE_HOSTS_DATA = []
 SCAN_METADATA = {} # Stores scan duration, range, etc.
 
@@ -53,6 +58,76 @@ def generate_ip_range(start_ip, end_ip):
     return ip_list
 
 
+def discover_local_networks(max_hosts_warn=4096):
+    """
+    Attempts to discover the local IPv4 networks the host is connected to.
+
+    Returns a list of ipaddress.IPv4Network objects.
+
+    Behavior:
+    - Prefer psutil.net_if_addrs() to obtain addresses and netmasks (cross-platform).
+    - Fallback: open a UDP socket to a public IP to get the primary local IP and assume /24.
+    - Filter out loopback and non-IPv4 addresses.
+    """
+    networks = []
+
+    if PSUTIL_AVAILABLE:
+        try:
+            addrs = psutil.net_if_addrs()
+            for ifname, addr_list in addrs.items():
+                for addr in addr_list:
+                    if addr.family == socket.AF_INET:
+                        ip = addr.address
+                        netmask = addr.netmask or '255.255.255.0'
+                        try:
+                            iface = ipaddress.IPv4Interface(f"{ip}/{netmask}")
+                            net = iface.network
+                            # skip loopback and very small/invalid networks
+                            if not net.is_loopback:
+                                networks.append(net)
+                        except Exception:
+                            # fallback to /24
+                            try:
+                                net = ipaddress.IPv4Network(f"{ip}/24", strict=False)
+                                if not net.is_loopback:
+                                    networks.append(net)
+                            except Exception:
+                                continue
+        except Exception:
+            networks = []
+
+    # Fallback if we couldn't use psutil or found nothing useful
+    if not networks:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # doesn't actually send data
+            s.connect(('8.8.8.8', 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+            net = ipaddress.IPv4Network(f"{local_ip}/24", strict=False)
+            if not net.is_loopback:
+                networks.append(net)
+        except Exception:
+            pass
+
+    # Remove duplicates
+    unique = []
+    for n in networks:
+        if all(n != u for u in unique):
+            unique.append(n)
+
+    # Optional: warn if networks are huge (too many hosts)
+    final = []
+    for net in unique:
+        if net.num_addresses > max_hosts_warn:
+            # keep it but user will be warned later before scanning
+            final.append(net)
+        else:
+            final.append(net)
+
+    return final
+
+
 # --------------------------------------
 # Helper Funcion (Kept the same)
 # --------------------------------------
@@ -60,38 +135,33 @@ def generate_ip_range(start_ip, end_ip):
 def get_hostname(ip_addr):
     """
     Performs a reverse DNS lookup to find the hostname of an IP address.
-    Returns the hostname if found, if not then it returns "Unkown Host" or the original IP.
+    Returns the hostname if found, if not then it returns "Unkown Host".
     """
-
     try:
-        # socket.gethostbyaddr returns a tuple: (hostname, aliaslist, ipaddrlist)
         hostname_info = socket.gethostbyaddr(ip_addr)
         return hostname_info[0]
-
     except socket.herror:
-        # Error is raised if the hostname cannot be found via DNS
         return "Unkown Host"
-
     except Exception as e:
-        # Handle other potential errors
         return f"Error: {e}"
 
 
 # ----------------------------------------------------------------------
-# Core Scanning Logic (Kept the same)
+# Core Scanning Logic (UPDATED)
 # ----------------------------------------------------------------------
 
-def host_scan(target_ip, output_text_box, lock, active_hosts_list):
+# NOTE: The PORTS_TO_CHECK list is now passed as an argument.
+def host_scan(target_ip, ports_list, output_text_box, lock, active_hosts_list):
     """
     Checks if a host is active by attempting a quick TCP connect on the configured ports.
-    Also performs a hostname lookup if active.
+    Records the first open port found and the hostname.
     """
 
-    is_active = False
+    open_port = None
     hostname = "N/A"
 
     try:
-        for port in PORTS_TO_CHECK:
+        for port in ports_list: # Use the user-defined ports list
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             socket.setdefaulttimeout(SCAN_TIMEOUT)
 
@@ -99,7 +169,7 @@ def host_scan(target_ip, output_text_box, lock, active_hosts_list):
             result = s.connect_ex((target_ip, port))
 
             if result == 0:
-                is_active = True
+                open_port = port
                 s.close()
                 hostname = get_hostname(target_ip)
                 break # Stop checking other ports once one is found
@@ -111,16 +181,17 @@ def host_scan(target_ip, output_text_box, lock, active_hosts_list):
     finally:
         # Thread-safe writing to the GUI
         with lock:
-            if is_active:
-                active_hosts_list.append((target_ip, hostname))
-                output_text_box.insert(tk.END, f"[ACTIVE] Host found: {target_ip} ({hostname})\n", 'active')
+            if open_port is not None:
+                # Store (IP, hostname, port) tuple
+                active_hosts_list.append((target_ip, hostname, open_port)) 
+                output_text_box.insert(tk.END, f"[ACTIVE] Host found: {target_ip} ({hostname}) on Port: {open_port}\n", 'active')
             else:
                 output_text_box.insert(tk.END, f"[INACTIVE] Host not responding: {target_ip}\n", 'inactive')
             output_text_box.see(tk.END)
 
 
 # ----------------------------------------------------------------------
-# PDF Generation Function (NEW)
+# PDF Generation Function (UPDATED for Port info)
 # ----------------------------------------------------------------------
 
 def generate_pdf_report(active_hosts_data, scan_metadata):
@@ -131,7 +202,6 @@ def generate_pdf_report(active_hosts_data, scan_metadata):
         messagebox.showinfo("Report Error", "Cannot generate PDF: No hosts were found active in the last scan.")
         return
 
-    # Use filedialog to ask user where to save the file
     filepath = filedialog.asksaveasfilename(
         defaultextension=".pdf",
         filetypes=[("PDF files", "*.pdf")],
@@ -140,7 +210,7 @@ def generate_pdf_report(active_hosts_data, scan_metadata):
     )
 
     if not filepath:
-        return # User canceled the save dialog
+        return 
 
     try:
         # Setup the PDF document
@@ -166,9 +236,10 @@ def generate_pdf_report(active_hosts_data, scan_metadata):
         story.append(Paragraph("<b>--- Active Hosts Found ({}) ---</b>".format(len(active_hosts_data)), styles['Heading2']))
         story.append(Spacer(1, 6))
 
-        for ip_addr, hostname_result in active_hosts_data:
-            # Format the entry for the PDF
-            entry = f"<b>IP Address:</b> {ip_addr} &nbsp;&nbsp;&nbsp; <b>Hostname:</b> {hostname_result}"
+        # ACTIVE HOSTS DATA NOW INCLUDES THE PORT
+        for ip_addr, hostname_result, open_port in active_hosts_data: 
+            # Format the entry for the PDF, now including the port
+            entry = f"<b>IP Address:</b> {ip_addr} &nbsp;&nbsp;&nbsp; <b>Hostname:</b> {hostname_result} &nbsp;&nbsp;&nbsp; <b>Open Port:</b> {open_port}"
             story.append(Paragraph(entry, styles['Normal']))
 
         # Build the PDF
@@ -181,32 +252,39 @@ def generate_pdf_report(active_hosts_data, scan_metadata):
 
 
 # ----------------------------------------------------------------------
-# GUI Functions
+# GUI Functions (UPDATED)
 # ----------------------------------------------------------------------
 
 def show_help_window():
 
     help_window = tk.Toplevel()
     help_window.title("Help")
-    help_window.geometry("600x270")
+    help_window.geometry("600x300")
     help_window.resizable(False, False)
 
-    # Updated help text to mention multi-port check
-    ports_str = ', '.join(map(str, PORTS_TO_CHECK))
+    ports_str = ', '.join(map(str, DEFAULT_PORTS_TO_CHECK))
     help_text_content = f"""
     Python Network Host Scanner Help
 
-    This tool is optimized for **network discovery** (finding active IPs)
-    in a given IP range. It does NOT perform a full port scan.
+    This tool is optimized for **network discovery** (finding active IPs) 
+    by checking specific TCP ports.
 
     How to Use:
-    1.) Enter the starting IP address (e.g., 192.168.150.1).
-    2.) Enter the ending IP address (e.g., 192.168.150.50).
-    3.) Click 'Start Scan' to begin checking all hosts in the range.
+    1.) Enter the starting IP and ending IP address.
+    2.) Enter the **Ports to Check** as a comma-separated list (e.g., 22,80,443,3389).
+    3.) Click 'Start Scan' to begin checking all hosts.
 
     Method Note:
-    The scanner performs a fast TCP check on the following ports to determine host activity: {ports_str}.
-    If a host responds to ANY of these ports, it is marked as ACTIVE.
+    The scanner performs a fast TCP check on the ports you specify. 
+    If a host responds to ANY of these ports, it is marked as ACTIVE, 
+    and the first port found is recorded.
+        Default Ports: {ports_str}
+
+        New Option:
+        - Check "Scan local networks" to have Critter detect the network(s) your machine
+            is attached to and scan those automatically. This uses psutil when available
+            and falls back to a guessed /24 network if not. Be cautious: large networks
+            can take a long time to scan.
     """
 
     help_text_box = scrolledtext.ScrolledText(help_window, width=50, height=10)
@@ -223,7 +301,7 @@ def create_gui():
     # Create the main window
     window = tk.Tk()
     window.title("Critter IP Network Scanner")
-    window.geometry("500x650")
+    window.geometry("500x700") # Made slightly taller for the new input
 
     # ... (Icon and Menubar setup)
     try:
@@ -245,17 +323,42 @@ def create_gui():
     ip_frame = tk.Frame(window)
     ip_frame.pack(pady=10)
 
-    start_ip_label = tk.Label(ip_frame, text="Start IP Address:")
+    start_ip_label = tk.Label(ip_frame, text="Start IP:")
     start_ip_label.pack(side=tk.LEFT, padx=5)
     start_ip_entry = tk.Entry(ip_frame, width=15)
     start_ip_entry.insert(0, "192.168.150.1")
     start_ip_entry.pack(side=tk.LEFT)
 
-    end_ip_label = tk.Label(ip_frame, text="End IP Address:")
+    end_ip_label = tk.Label(ip_frame, text="End IP:")
     end_ip_label.pack(side=tk.LEFT, padx=5)
     end_ip_entry = tk.Entry(ip_frame, width=15)
     end_ip_entry.insert(0, "192.168.150.50")
     end_ip_entry.pack(side=tk.LEFT)
+
+    # --- Scan local networks checkbox ---
+    local_scan_var = tk.BooleanVar(value=False)
+    def toggle_range_entries(*args):
+        if local_scan_var.get():
+            start_ip_entry.config(state=tk.DISABLED)
+            end_ip_entry.config(state=tk.DISABLED)
+        else:
+            start_ip_entry.config(state=tk.NORMAL)
+            end_ip_entry.config(state=tk.NORMAL)
+
+    local_scan_check = tk.Checkbutton(window, text="Scan local networks (auto-detect)", variable=local_scan_var, command=toggle_range_entries)
+    local_scan_check.pack(pady=5)
+
+    # --- NEW PORT INPUT WIDGET ---
+    ports_frame = tk.Frame(window)
+    ports_frame.pack(pady=5)
+    
+    ports_label = tk.Label(ports_frame, text="Ports (e.g., 22,80,443):")
+    ports_label.pack(side=tk.LEFT, padx=5)
+    
+    ports_entry = tk.Entry(ports_frame, width=40)
+    ports_entry.insert(0, ','.join(map(str, DEFAULT_PORTS_TO_CHECK))) 
+    ports_entry.pack(side=tk.LEFT)
+    # -----------------------------
 
 
     # Output the display area
@@ -275,12 +378,50 @@ def create_gui():
 
         start_ip = start_ip_entry.get()
         end_ip = end_ip_entry.get()
-
-        ip_targets = generate_ip_range(start_ip, end_ip)
-
-        if not ip_targets:
-            messagebox.showerror("Input Error", "Invalid IP range. Check start and end IP addresses.")
+        
+        # Parse the ports from the new input field
+        ports_input = ports_entry.get().replace(' ', '')
+        try:
+            ports_to_check = [int(p) for p in ports_input.split(',') if p.isdigit() and 0 < int(p) <= 65535]
+            if not ports_to_check:
+                 messagebox.showerror("Input Error", "Please enter valid, comma-separated ports (1-65535).")
+                 return
+        except ValueError:
+            messagebox.showerror("Input Error", "Invalid port format. Use comma-separated numbers (e.g., 22,80).")
             return
+
+
+        # If user selected automatic local network discovery, use that instead
+        if local_scan_var.get():
+            networks = discover_local_networks()
+            if not networks:
+                messagebox.showerror("Discovery Error", "Could not discover local networks. Please verify your network interfaces or uncheck the auto-scan option.")
+                return
+
+            # Build list of target IPs from discovered networks (host addresses only)
+            ip_targets = []
+            total_addrs = 0
+            for net in networks:
+                total_addrs += net.num_addresses
+                if net.num_addresses > 4096:
+                    proceed = messagebox.askyesno("Large Network Warning", f"Discovered network {net} contains {net.num_addresses} addresses and may take a long time to scan. Continue?")
+                    if not proceed:
+                        return
+                # use .hosts() to exclude network/broadcast addresses
+                for ip in net.hosts():
+                    ip_targets.append(str(ip))
+
+            if not ip_targets:
+                messagebox.showerror("Discovery Error", "No usable host addresses found in discovered networks.")
+                return
+            ip_range_description = ", ".join(str(n) for n in networks)
+        else:
+            ip_targets = generate_ip_range(start_ip, end_ip)
+
+            if not ip_targets:
+                messagebox.showerror("Input Error", "Invalid IP range. Check start and end IP addresses.")
+                return
+            ip_range_description = f"{start_ip} to {end_ip}"
 
         # Clear global list before new scan
         global FINAL_ACTIVE_HOSTS_DATA
@@ -289,31 +430,30 @@ def create_gui():
         # Clear output box and print header
         output_text_box.delete('1.0', tk.END)
         start_time = time.time()
-        ports_str = ', '.join(map(str, PORTS_TO_CHECK))
+        ports_str = ', '.join(map(str, ports_to_check))
 
         output_text_box.insert(tk.END, "-" * 50 + "\n")
         output_text_box.insert(tk.END, f"Scanning IP range: {start_ip} to {end_ip}\n")
-        output_text_box.insert(tk.END, f"Checking reachability on ports: {ports_str}\n")
+        output_text_box.insert(tk.END, f"Checking reachability on **USER-DEFINED** ports: {ports_str}\n")
         output_text_box.insert(tk.END, "Scanning started at: " + str(datetime.now()) + "\n")
         output_text_box.insert(tk.END, "-" * 50 + "\n")
 
 
-        active_hosts = [] # List to store confirmed active IPs
+        active_hosts = [] # List to store confirmed active IPs (ip, hostname, port)
 
         def master_scan_process():
-            """The master thread process that launches and monitors all host scan threads."""
-            threads = []
-
-            for ip in ip_targets:
-                # Start a separate thread for EACH IP in the range
-                thread = threading.Thread(target=host_scan,
-                                          args=(ip, output_text_box, gui_lock, active_hosts))
-                threads.append(thread)
-                thread.start()
-
-            # Wait for all individual host-scan threads to complete
-            for thread in threads:
-                thread.join()
+            """The master thread process that launches and monitors host-scan tasks using a thread pool."""
+            # Limit concurrency to avoid creating thousands of threads
+            max_workers = 200
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(host_scan, ip, ports_to_check, output_text_box, gui_lock, active_hosts) for ip in ip_targets]
+                # Wait for all futures to complete and propagate exceptions if any
+                for f in futures:
+                    try:
+                        f.result()
+                    except Exception:
+                        # Individual host_scan errors are already handled; ignore here
+                        pass
 
             end_time = time.time()
             duration = round(end_time - start_time, 2)
@@ -325,7 +465,7 @@ def create_gui():
                 "Scan Duration": f"{duration} seconds",
                 "Total IPs Scanned": len(ip_targets),
                 "Active Hosts Found": len(active_hosts),
-                "IP Range": f"{start_ip} to {end_ip}",
+                "IP Range": ip_range_description,
                 "Ports Checked": ports_str
             }
 
@@ -338,8 +478,9 @@ def create_gui():
                     output_text_box.insert(tk.END, f"{key}: {value}\n", 'active' if 'Active Hosts' in key else None)
                 output_text_box.insert(tk.END, "Active Host List:\n")
 
-                for ip_addr, hostname_result in active_hosts:
-                    output_text_box.insert(tk.END, f"  - {ip_addr} ({hostname_result})\n", 'active')
+                # Print results, now including the port
+                for ip_addr, hostname_result, open_port in active_hosts:
+                    output_text_box.insert(tk.END, f"  - {ip_addr} ({hostname_result}) [Port: {open_port}]\n", 'active')
 
                 output_text_box.insert(tk.END, "-" * 50 + "\n")
                 output_text_box.see(tk.END)
@@ -361,12 +502,13 @@ def create_gui():
     scan_button = tk.Button(button_frame, text="Start Scan", command=start_scan_thread, width=15)
     scan_button.pack(side=tk.LEFT, padx=10)
 
-    # --- NEW PDF BUTTON ---
+    # --- PDF BUTTON ---
     pdf_button = tk.Button(
         button_frame,
         text="💾 Save as PDF",
-        command=lambda: generate_pdf_report(FINAL_ACTIVE_HOSTS_DATA, SCAN_METADATA),
-        state=tk.DISABLED, # Disabled until the first scan is complete
+        # Lambda function now passes the updated list format
+        command=lambda: generate_pdf_report(FINAL_ACTIVE_HOSTS_DATA, SCAN_METADATA), 
+        state=tk.DISABLED,
         width=15
     )
     pdf_button.pack(side=tk.LEFT, padx=10)
@@ -378,3 +520,4 @@ def create_gui():
 
 if __name__ == "__main__":
     create_gui()
+
